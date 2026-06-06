@@ -1,0 +1,335 @@
+# ====================== 1. Library Imports and Global Environment Configuration ======================
+import os
+import glob
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+
+os.environ['TF_DETERMINISTIC_OPS'] = '1'
+os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from scipy.interpolate import interp1d
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    Dense, Input, BatchNormalization, SpatialDropout1D,
+    GRU, Conv1D, Concatenate, Bidirectional, GlobalAveragePooling1D
+)
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.initializers import GlorotUniform, HeUniform
+from sklearn.base import BaseEstimator, TransformerMixin
+import random
+
+random.seed(42)
+np.random.seed(42)
+tf.random.set_seed(42)
+tf.keras.utils.set_random_seed(42)
+
+
+# ====================== 2. Robust Scaler Class ======================
+class RobustScaler(BaseEstimator, TransformerMixin):
+    def __init__(self):
+        self.scalers = []
+
+    def fit(self, X, y=None):
+        n_channels = X.shape[-1]
+        for ch in range(n_channels):
+            ch_data = X[..., ch].reshape(-1, 1)
+            ch_data = np.nan_to_num(ch_data, nan=0.0, posinf=1e6, neginf=-1e6)
+            ch_data = np.clip(ch_data, -1e4, 1e4)
+            scaler = StandardScaler()
+            scaler.fit(ch_data)
+            self.scalers.append(scaler)
+        return self
+
+    def transform(self, X):
+        X_transformed = []
+        for ch in range(X.shape[-1]):
+            ch_data = X[..., ch].reshape(-1, 1)
+            ch_data = np.nan_to_num(ch_data, nan=0.0, posinf=1e6, neginf=-1e6)
+            ch_data = self.scalers[ch].transform(ch_data)
+            ch_data = ch_data.reshape(X.shape[0], X.shape[1])
+            X_transformed.append(ch_data)
+        return np.stack(X_transformed, axis=-1).astype(np.float32)
+
+
+# ====================== 3. Signal Processing and Window Generation Class ======================
+class SignalProcessor:
+    def __init__(self, window_size=512, step_size=128):
+        self.window_size = window_size
+        self.step_size = step_size
+
+    @staticmethod
+    def _iqr_outlier_detection(signal):
+        q1 = np.percentile(signal, 25)
+        q3 = np.percentile(signal, 75)
+        iqr = q3 - q1
+        if iqr == 0:
+            return np.zeros_like(signal, dtype=bool)
+        bounds = (q1 - 1.5 * iqr, q3 + 1.5 * iqr)
+        return (signal < bounds[0]) | (signal > bounds[1])
+
+    def process_signals(self, data):
+        n_samples = (len(data) - self.window_size) // self.step_size + 1
+        windows = []
+        labels = []
+
+        for i in range(n_samples):
+            start = i * self.step_size
+            end = start + self.window_size
+
+            signals = []
+            valid = True
+            for axis in ['x_accel', 'y_accel', 'z_accel']:
+                raw_signal = data[axis].iloc[start:end].values
+                outlier_mask = self._iqr_outlier_detection(raw_signal)
+                cleaned = raw_signal[~outlier_mask]
+
+                if len(cleaned) < 0.85 * self.window_size:
+                    valid = False
+                    break
+
+                if len(cleaned) != self.window_size:
+                    x_old = np.linspace(0, 1, len(cleaned))
+                    x_new = np.linspace(0, 1, self.window_size)
+                    interp_func = interp1d(x_old, cleaned, kind='linear', fill_value='extrapolate')
+                    cleaned = interp_func(x_new)
+
+                signals.append(cleaned)
+
+            if valid and np.all([np.max(np.abs(s)) < 1e5 for s in signals]):
+                windows.append(signals)
+                labels.append(data['compaction'].iloc[end - 1])
+
+        return windows, np.array(labels)
+
+
+# ====================== 4. Deep Learning Model Construction Function ======================
+def build_optimized_model(input_shape):
+    conv_init = GlorotUniform(seed=42)
+    gru_init = GlorotUniform(seed=42)
+    dense_init = HeUniform(seed=42)
+
+    inputs = Input(shape=input_shape)
+    x = Conv1D(64, 3, padding='same', activation='swish',
+               kernel_initializer=conv_init, bias_initializer='zeros')(inputs)
+    x = BatchNormalization()(x)
+    x = SpatialDropout1D(0.2)(x)
+
+    branches = []
+    dilation_rates = [1, 2, 3]
+    for rate in dilation_rates:
+        conv_base = Conv1D(64, 5, padding='causal', activation='swish',
+                           kernel_initializer=conv_init, bias_initializer='zeros')(x)
+        conv_dilated = Conv1D(64, 5, padding='causal', dilation_rate=rate, activation='swish',
+                              kernel_initializer=conv_init, bias_initializer='zeros')(x)
+        gru = Bidirectional(GRU(64, return_sequences=True,
+                                kernel_initializer=gru_init, recurrent_initializer=gru_init,
+                                bias_initializer='zeros'))(x)
+        merged = Concatenate()([conv_base, conv_dilated, gru])
+        branches.append(merged)
+
+    x = Concatenate()(branches)
+    x = Dense(256, activation='swish',
+              kernel_initializer=dense_init, bias_initializer='zeros')(x)
+    x = GlobalAveragePooling1D()(x)
+    outputs = Dense(1, kernel_initializer=dense_init, bias_initializer='zeros')(x)
+
+    model = Model(inputs=inputs, outputs=outputs)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
+    model.compile(
+        optimizer=optimizer,
+        loss='mse',
+        metrics=['mae']
+    )
+    return model
+
+
+# ====================== 5. Enhanced Training Metrics Callback Class ======================
+class EnhancedMetricsCallback(tf.keras.callbacks.Callback):
+    def __init__(self, X_train, y_train, X_val, y_val, log_freq=5):
+        super().__init__()
+        self.X_train = X_train
+        self.y_train = y_train.squeeze()
+        self.X_val = X_val
+        self.y_val = y_val.squeeze()
+        self.log_freq = log_freq
+
+    def on_epoch_end(self, epoch, logs=None):
+        current_epoch = epoch + 1
+        if current_epoch % self.log_freq == 0:
+            train_pred = self.model.predict(self.X_train, verbose=0).squeeze()
+            train_mse = mean_squared_error(self.y_train, train_pred)
+            train_mae = mean_absolute_error(self.y_train, train_pred)
+            train_r2 = r2_score(self.y_train, train_pred)
+            
+            val_pred = self.model.predict(self.X_val, verbose=0).squeeze()
+            val_mse = mean_squared_error(self.y_val, val_pred)
+            val_mae = mean_absolute_error(self.y_val, val_pred)
+            val_r2 = r2_score(self.y_val, val_pred)
+
+            print(f"\nEpoch {current_epoch}")
+            print(f"Train => MSE: {train_mse:.4f} | MAE: {train_mae:.4f} | R²: {train_r2:.4f}")
+            print(f"Valid => MSE: {val_mse:.4f} | MAE: {val_mae:.4f} | R²: {val_r2:.4f}")
+
+
+# ====================== 6. Model Performance Evaluation Function ======================
+def evaluate_model(model, X, y_true, dataset_name):
+    y_pred = model.predict(X).squeeze()
+    y_true = y_true.squeeze()
+
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+
+    print(f"\n{dataset_name} Evaluation Results:")
+    print(f"MSE: {mse:.4f} | RMSE: {rmse:.4f}")
+    print(f"MAE: {mae:.4f} | R²: {r2:.4f}")
+    return {'mse': mse, 'mae': mae, 'r2': r2, 'y_true': y_true, 'y_pred': y_pred}
+
+
+# ====================== 7. Main Program Execution Flow ======================
+if __name__ == "__main__":
+    def load_multiple_csvs(folder_path):
+        csv_files = glob.glob(os.path.join(folder_path, "*.csv"))
+        csv_files.sort()
+        dfs = []
+        for file in csv_files:
+            try:
+                df_full = pd.read_csv(file, encoding='GBK')
+                if len(df_full) > 1000:
+                    df = df_full.iloc[500:-500]
+                else:
+                    print(f"File {os.path.basename(file)} has insufficient rows, skipped")
+                    continue
+                dfs.append(df)
+                print(f"Successfully loaded: {os.path.basename(file)} (Original {len(df_full)} rows, using {len(df)} rows)")
+            except Exception as e:
+                print(f"Failed to load {os.path.basename(file)}: {str(e)}")
+                continue
+        if not dfs:
+            raise ValueError("No valid CSV files found")
+        combined_df = pd.concat(dfs, ignore_index=True)
+        print(f"\nTotal {len(csv_files)} files loaded, combined data size: {len(combined_df)} rows")
+        return combined_df
+
+    data_folder = r"D:\5\day1\owe"
+    data = load_multiple_csvs(data_folder)
+
+    data = data.drop(columns=['timestamp'])
+    for col in ['x_accel', 'y_accel', 'z_accel', 'compaction']:
+        data[col] = pd.to_numeric(data[col], errors='coerce')
+    data = data.dropna().reset_index(drop=True)
+    print(f"Remaining data after preprocessing: {len(data)} rows")
+
+    train_raw_list = []
+    val_raw_list = []
+    test_raw_list = []
+
+    grouped = data.groupby('compaction')
+    total_groups = len(grouped)
+    print(f"\nDetected {total_groups} distinct compaction labels, starting dataset splitting per label")
+
+    for compaction_val, df_group in grouped:
+        group_len = len(df_group)
+        val_start = int(0.4 * group_len)
+        val_end = int(0.5 * group_len)
+        test_end = int(0.6 * group_len)
+
+        if val_start >= val_end or val_end >= test_end:
+            print(f"Label {compaction_val} has {group_len} rows, invalid split interval, skipped")
+            continue
+
+        df_train_single = pd.concat([
+            df_group.iloc[:val_start],
+            df_group.iloc[test_end:]
+        ], ignore_index=True)
+        df_val_single = df_group.iloc[val_start:val_end].reset_index(drop=True)
+        df_test_single = df_group.iloc[val_end:test_end].reset_index(drop=True)
+
+        train_raw_list.append(df_train_single)
+        val_raw_list.append(df_val_single)
+        test_raw_list.append(df_test_single)
+
+        print(
+            f"Label {compaction_val} split completed | Train:{len(df_train_single)} rows Val:{len(df_val_single)} rows Test:{len(df_test_single)} rows")
+
+    if not train_raw_list or not val_raw_list or not test_raw_list:
+        raise ValueError("No valid split datasets, please check label data volume")
+
+    data_train_raw = pd.concat(train_raw_list, ignore_index=True)
+    data_val_raw = pd.concat(val_raw_list, ignore_index=True)
+    data_test_raw = pd.concat(test_raw_list, ignore_index=True)
+
+    print(f"\n===== Final Raw Dataset Split Results =====")
+    print(f"Training set raw data: {len(data_train_raw)} rows")
+    print(f"Validation set raw data: {len(data_val_raw)} rows")
+    print(f"Test set raw data: {len(data_test_raw)} rows")
+
+    window_size = 512
+    step_size = 128
+    processor = SignalProcessor(window_size=window_size, step_size=step_size)
+
+    windows_train, labels_train = processor.process_signals(data_train_raw)
+    windows_val, labels_val = processor.process_signals(data_val_raw)
+    windows_test, labels_test = processor.process_signals(data_test_raw)
+
+    for name, windows, labels in [("Training set", windows_train, labels_train),
+                                  ("Validation set", windows_val, labels_val),
+                                  ("Test set", windows_test, labels_test)]:
+        if len(windows) == 0:
+            raise ValueError(f"{name} generated no valid windows, please check data or window parameters")
+        print(f"\n{name} generated valid windows: {len(windows)}, corresponding labels: {len(labels)}")
+
+    X_train = np.array([np.stack([x_win, y_win, z_win], axis=-1) for x_win, y_win, z_win in windows_train],
+                       dtype=np.float32)
+    y_train = labels_train.astype(np.float32).reshape(-1, 1)
+    X_val = np.array([np.stack([x_win, y_win, z_win], axis=-1) for x_win, y_win, z_win in windows_val],
+                     dtype=np.float32)
+    y_val = labels_val.astype(np.float32).reshape(-1, 1)
+    X_test = np.array([np.stack([x_win, y_win, z_win], axis=-1) for x_win, y_win, z_win in windows_test],
+                      dtype=np.float32)
+    y_test = labels_test.astype(np.float32).reshape(-1, 1)
+
+    print(f"\nModel Input Window Shapes:")
+    print(f"Training set: {X_train.shape}, Validation set: {X_val.shape}, Test set: {X_test.shape}")
+
+    scaler = RobustScaler()
+    X_train_std = scaler.fit_transform(X_train)
+    X_val_std = scaler.transform(X_val)
+    X_test_std = scaler.transform(X_test)
+
+    input_shape = (X_train_std.shape[1], X_train_std.shape[2])
+    model = build_optimized_model(input_shape)
+    model.summary()
+
+    metrics_callback = EnhancedMetricsCallback(
+        X_train_std, y_train, X_val_std, y_val, log_freq=5
+    )
+    history = model.fit(
+        X_train_std, y_train,
+        validation_data=(X_val_std, y_val),
+        epochs=600,
+        batch_size=64,
+        callbacks=[
+            EarlyStopping(patience=50, restore_best_weights=True),
+            ReduceLROnPlateau(factor=0.5, patience=20),
+            metrics_callback
+        ]
+    )
+
+    train_result = evaluate_model(model, X_train_std, y_train, "Training Set")
+    val_result = evaluate_model(model, X_val_std, y_val, "Validation Set")
+    test_result = evaluate_model(model, X_test_std, y_test, "Test Set")
+
+    metrics_df = pd.DataFrame(
+        [
+            {'mse': train_result['mse'], 'mae': train_result['mae'], 'r2': train_result['r2']},
+            {'mse': val_result['mse'], 'mae': val_result['mae'], 'r2': val_result['r2']},
+            {'mse': test_result['mse'], 'mae': test_result['mae'], 'r2': test_result['r2']}
+        ],
+        index=['Training Set', 'Validation Set', 'Test Set']
+    )
+    print("\n======== Comprehensive Performance Comparison ========")
+    print(metrics_df.round(4))
